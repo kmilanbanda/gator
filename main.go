@@ -242,8 +242,24 @@ func handlerFollowing(s *state, cmd command, user database.User) error {
 	fmt.Printf(" * %s", follow.FeedName)
 	}
 
+	return nil	
+}
+
+func handlerUnfollow(s *state, cmd command, user database.User) error {
+	if len(cmd.args) < 1 {
+		return fmt.Errorf("Error: Unfollow expects a url.")
+	}
+
+	deleteParams := database.DeleteFeedFollowParams{
+		Url:	cmd.args[0],
+		UserID: user.ID,
+	}
+	err := s.db.DeleteFeedFollow(context.Background(), deleteParams)
+	if err != nil {
+		return fmt.Errorf("Error unfollowing feed: %w", err)
+	}
+
 	return nil
-	
 }
 
 type RSSItem struct {
@@ -325,6 +341,7 @@ func main() {
 	cmds.register("feeds", handlerFeeds)
 	cmds.register("follow", middlewareLoggedIn(handlerFollow))
 	cmds.register("following", middlewareLoggedIn(handlerFollowing))
+	cmds.register("unfollow", middlewareLoggedIn(handlerUnfollow))
 
 	if len(os.Args) < 2 {
 		log.Fatalf("Error: no arguments")
