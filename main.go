@@ -16,6 +16,7 @@ import (
 	"html"
 	"io"
 	"encoding/xml"
+	"strconv"
 )
 
 type state struct {
@@ -149,11 +150,22 @@ func handlerUsers(s *state, cmd command) error {
 }
 
 func handlerAgg(s *state, cmd command) error {
-	feed, err := fetchFeed(context.Background(), "https://www.wagslane.dev/index.xml")
-	if err != nil {
-		return fmt.Errorf("Error aggregating: %w", err)
+	if len(cmd.args) < 1 {
+		return fmt.Errorf("Error: expecting 1 argument for agg command")
 	}
-	fmt.Printf("%+v\n", feed)
+	timeBetweenRequests, err := time.ParseDuration(cmd.args[0])
+	if err != nil {
+		return fmt.Errorf("Error setting request delay: %w", err)
+	}
+	fmt.Printf("Collecting feed every %s\n", cmd.args[0])
+
+	ticker := time.NewTicker(timeBetweenRequests)
+	for ; ; <-ticker.C {
+		err = scrapeFeeds(s)
+		if err != nil {
+			log.Printf("Error scraping feeds: %w", err)
+		}
+	}
 
 	return nil
 }
@@ -165,6 +177,8 @@ func handlerAddFeed(s *state, cmd command, user database.User) error {
 
 	feedParams := database.CreateFeedParams{
 		ID:		uuid.New(),
+		CreatedAt:	time.Now(),
+		UpdatedAt:	time.Now(),
 		Name:		cmd.args[0],
 		Url:		cmd.args[1],
 		UserID:		user.ID,
@@ -262,6 +276,32 @@ func handlerUnfollow(s *state, cmd command, user database.User) error {
 	return nil
 }
 
+func handlerBrowse(s *state, cmd command, user database.User) error {
+	limit := 2
+	var err error
+	if len(cmd.args) >= 1 {
+		limit, err = strconv.Atoi(cmd.args[0])
+		if err != nil {
+			return fmt.Errorf("Error during string conversion Atoi(): %w", err)
+		}
+	}
+
+	getPostsForUserParams := database.GetPostsForUserParams{
+		UserID:		user.ID,
+		Limit:		int32(limit),
+	}
+	posts, err := s.db.GetPostsForUser(context.Background(), getPostsForUserParams)
+	if err != nil {
+		return fmt.Errorf("Error getting posts for user: %w", err)
+	}
+
+	for _, post := range posts {
+		fmt.Printf(" * %s (%s) \n     - %s\n", post.Title, post.Url, post.Description)
+	}
+
+	return nil
+}
+
 type RSSItem struct {
 	Title		string `xml:"title"`
 	Link		string `xml:"link"`
@@ -313,6 +353,78 @@ func fetchFeed(ctx context.Context, feedURL string) (*RSSFeed, error) {
 	return &feed, nil
 }
 
+func scrapeFeeds(s *state) error {
+	feed, err := s.db.GetNextFeedToFetch(context.Background())
+	if err != nil {
+		return fmt.Errorf("Error getting next feed to fetch: %w", err)
+	}
+	
+	fetchTime := sql.NullTime{
+		Time:	time.Now(),
+		Valid:	true,
+	}
+	markFeedFetchedParams := database.MarkFeedFetchedParams{
+		ID:		feed.ID,
+		LastFetchedAt:	fetchTime,
+	}
+	err = s.db.MarkFeedFetched(context.Background(), markFeedFetchedParams)
+	if err != nil {
+		return fmt.Errorf("Error updating feed last_fetched_at: %w", err)
+	}
+
+	rssFeed, err := fetchFeed(context.Background(), feed.Url)
+	if err != nil {
+		return fmt.Errorf("Error fetching feed: %w", err)
+	}
+
+	for _, item := range rssFeed.Channel.Item {
+		description := sql.NullString{
+			String:		item.Description,
+			Valid:		true,
+		}
+
+		published, err := parseTime(item.PubDate) 
+		if err != nil {
+			log.Printf("Error parsing published date: %w", err)
+		}
+
+		createPostParams := database.CreatePostParams{
+			ID:		uuid.New(),
+			CreatedAt:	time.Now(),
+			UpdatedAt:	time.Now(),
+			Title:		item.Title,
+			Url:		item.Link,
+			Description:	description,
+			PublishedAt:	published,
+			FeedID:		feed.ID,
+		}
+		_, err = s.db.CreatePost(context.Background(), createPostParams)
+		if err != nil {
+			log.Printf("Error: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func parseTime(timeStr string) (time.Time, error) {
+    layouts := []string{
+        time.RFC3339,
+        time.RFC822,
+        time.RFC1123,
+        "2006-01-02 15:04:05",
+        "02 Jan 2006 15:04:05 MST",
+    }
+    
+    for _, layout := range layouts {
+        if t, err := time.Parse(layout, timeStr); err == nil {
+            return t, nil
+        }
+    }
+    
+    return time.Time{}, fmt.Errorf("unable to parse time: %s", timeStr)
+}
+
 func main() {
 	cfg, err := config.Read()
 	if err != nil {
@@ -342,6 +454,7 @@ func main() {
 	cmds.register("follow", middlewareLoggedIn(handlerFollow))
 	cmds.register("following", middlewareLoggedIn(handlerFollowing))
 	cmds.register("unfollow", middlewareLoggedIn(handlerUnfollow))
+	cmds.register("browse", middlewareLoggedIn(handlerBrowse))
 
 	if len(os.Args) < 2 {
 		log.Fatalf("Error: no arguments")
